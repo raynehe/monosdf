@@ -8,6 +8,8 @@ from utils import rend_util
 from glob import glob
 import cv2
 import random
+import pickle as pkl
+import json
 
 class SceneDataset(torch.utils.data.Dataset):
 
@@ -133,15 +135,17 @@ class SceneDatasetDN(torch.utils.data.Dataset):
                  img_res,
                  scan_id=0,
                  center_crop_type='xxxx',
+                 data_type='splishsplash',
                  use_mask=False,
                  num_views=-1
                  ):
 
-        self.instance_dir = os.path.join('../data', data_dir, 'scan{0}'.format(scan_id))
+        self.instance_dir = os.path.join('/home/rayne/datasets/monosdf', data_dir, 'scan{0}'.format(scan_id))
 
         self.total_pixels = img_res[0] * img_res[1]
         self.img_res = img_res
         self.num_views = num_views
+        self.data_type = data_type
         assert num_views in [-1, 3, 6, 9]
         
         assert os.path.exists(self.instance_dir), "Data directory is empty"
@@ -157,6 +161,7 @@ class SceneDatasetDN(torch.utils.data.Dataset):
         image_paths = glob_data(os.path.join('{0}'.format(self.instance_dir), "*_rgb.png"))
         depth_paths = glob_data(os.path.join('{0}'.format(self.instance_dir), "*_depth.npy"))
         normal_paths = glob_data(os.path.join('{0}'.format(self.instance_dir), "*_normal.npy"))
+        particles_paths = glob_data(os.path.join('{0}'.format(self.instance_dir), 'particles', "*.npz"))
         
         # mask is only used in the replica dataset as some monocular depth predictions have very large error and we ignore it
         if use_mask:
@@ -199,6 +204,11 @@ class SceneDatasetDN(torch.utils.data.Dataset):
                 offset = 0
                 intrinsics[0, 2] -= offset
                 intrinsics[:2, :] *= scale
+            elif center_crop_type == 'center_crop_for_fluid':
+                scale = 384 / 400
+                offset = 0 # CenterCrop
+                intrinsics[0, 2] -= offset
+                intrinsics[:2, :] *= scale
             elif center_crop_type == 'no_crop':  # for scannet dataset, we already adjust the camera intrinsic duing preprocessing so nothing to be done here
                 pass
             else:
@@ -207,12 +217,39 @@ class SceneDatasetDN(torch.utils.data.Dataset):
             self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
+        # self.all_rays = []
+
+        # if data_dir == 'fluid':
+        #     pose_path = os.path.join(self.instance_dir, 'scene', 'trajectory.npy')
+        #     self.pose_all = torch.from_numpy(np.load(pose_path)).float()
+        #     intrinsic_path = os.path.join(self.instance_dir, 'intrinsic.npy')
+        #     self.intrinsics_all = torch.from_numpy(np.load(intrinsic_path)).float()
+
+        #     for i in range(self.n_images):
+        #         # crop intrinsics
+        #         scale = 384 / 400
+        #         offset = 0
+        #         self.intrinsics_all[i][0, 2] -= offset
+        #         self.intrinsics_all[i][:2, :] *= scale
+        #         # compute rays
+        #         pose = self.pose_all[i]
+        #         focal = self.intrinsics_all[i][0, 0]
+        #         directions = self.get_ray_directions(self.img_res[0], self.img_res[1], focal)
+        #         rays_o, rays_d = self.get_rays(directions, pose[:3])
+        #         self.all_rays.append(torch.cat([rays_o, rays_d], -1))
+
         self.rgb_images = []
         for path in image_paths:
             rgb = rend_util.load_rgb(path)
             rgb = rgb.reshape(3, -1).transpose(1, 0)
             self.rgb_images.append(torch.from_numpy(rgb).float())
             
+        self.particles_poss = []
+        for path in particles_paths:
+            particles_pos, _ = self._read_particles(path)
+            self.particles_poss.append(np.stack(particles_pos, 0))
+        self.particles_poss = torch.from_numpy(np.stack(self.particles_poss, 0)).float()
+
         self.depth_images = []
         self.normal_images = []
 
@@ -250,6 +287,8 @@ class SceneDatasetDN(torch.utils.data.Dataset):
         uv = uv.reshape(2, -1).transpose(1, 0)
 
         sample = {
+            # "rays": self.all_rays[idx],
+            "particles_poss": self.particles_poss[idx],
             "uv": uv,
             "intrinsics": self.intrinsics_all[idx],
             "pose": self.pose_all[idx]
@@ -300,3 +339,73 @@ class SceneDatasetDN(torch.utils.data.Dataset):
 
     def get_scale_mat(self):
         return np.load(self.cam_file)['scale_mat_0']
+
+    def _read_particles(self, particle_path):
+        """
+        read initial particle information and the bounding box information
+        """
+        if self.data_type == 'blender':
+            # particle_info = np.load(osp.join(self.root_dir, self.split, particle_path))
+            # with open(osp.join(self.root_dir, self.split, particle_path), 'rb') as fp:
+            with open(particle_path, 'rb') as fp:
+                particle_info = pkl.load(fp)
+            particle_pos = np.array(particle_info['location']).reshape(-1, 3)
+            particle_vel = np.array(particle_info['velocity']).reshape(-1, 3)
+        elif self.data_type == 'splishsplash':
+            # particle_info = np.load(osp.join(self.root_dir, self.split, particle_path))
+            particle_info = np.load(particle_path)
+            particle_pos = particle_info['pos']
+            particle_vel = particle_info['vel']
+        else:
+            raise NotImplementedError('please enter correct data type')
+        # import ipdb;ipdb.set_trace()
+        # particle_pos = torch.from_numpy(particle_pos).float()
+        # particle_vel = torch.from_numpy(particle_vel).float()
+        return particle_pos, particle_vel
+    
+    def get_ray_directions(self, H, W, focal):
+        """
+        Get ray directions for all pixels in camera coordinate.
+        Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+                ray-tracing-generating-camera-rays/standard-coordinate-systems
+
+        Inputs:
+            H, W, focal: image height, width and focal length
+
+        Outputs:
+            directions: (H, W, 3), the direction of the rays in camera coordinate
+        """
+        from kornia import create_meshgrid
+        grid = create_meshgrid(H, W, normalized_coordinates=False)[0]
+        i, j = grid.unbind(-1)
+        # the direction here is without +0.5 pixel centering as calibration is not so accurate
+        # see https://github.com/bmild/nerf/issues/24
+        directions = \
+            torch.stack([(i-W/2)/focal, -(j-H/2)/focal, -torch.ones_like(i)], -1) # (H, W, 3)
+
+        return directions
+    
+    def get_rays(self, directions, c2w):
+        """
+        Get ray origin and normalized directions in world coordinate for all pixels in one image.
+        Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+                ray-tracing-generating-camera-rays/standard-coordinate-systems
+
+        Inputs:
+            directions: (H, W, 3) precomputed ray directions in camera coordinate
+            c2w: (3, 4) transformation matrix from camera coordinate to world coordinate
+
+        Outputs:
+            rays_o: (H*W, 3), the origin of the rays in world coordinate
+            rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
+        """
+        # Rotate ray directions from camera coordinate to the world coordinate
+        rays_d = directions @ c2w[:, :3].T # (H, W, 3)
+        rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+        # The origin of all rays is the camera origin in world coordinate
+        rays_o = c2w[:, 3].expand(rays_d.shape) # (H, W, 3)
+
+        # rays_d = rays_d.view(-1, 3)
+        # rays_o = rays_o.view(-1, 3)
+
+        return rays_o, rays_d

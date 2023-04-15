@@ -208,6 +208,7 @@ class MonoSDFTrainRunner():
                 model_input["intrinsics"] = model_input["intrinsics"].cuda()
                 model_input["uv"] = model_input["uv"].cuda()
                 model_input['pose'] = model_input['pose'].cuda()
+                model_input['particles_poss'] = model_input['particles_poss'].squeeze(0).cuda()
                 
                 split = utils.split_input(model_input, self.total_pixels, n_pixels=self.split_n_pixels)
                 res = []
@@ -222,11 +223,13 @@ class MonoSDFTrainRunner():
 
                 batch_size = ground_truth['rgb'].shape[0]
                 model_outputs = utils.merge_output(res, self.total_pixels, batch_size)
+                # ground_truth['rgb']
                 plot_data = self.get_plot_data(model_input, model_outputs, model_input['pose'], ground_truth['rgb'], ground_truth['normal'], ground_truth['depth'])
 
                 plt.plot(self.model.module.implicit_network,
                         indices,
                         plot_data,
+                        model_input['particles_poss'],
                         self.plots_dir,
                         epoch,
                         self.img_res,
@@ -240,6 +243,8 @@ class MonoSDFTrainRunner():
                 model_input["intrinsics"] = model_input["intrinsics"].cuda()
                 model_input["uv"] = model_input["uv"].cuda()
                 model_input['pose'] = model_input['pose'].cuda()
+                model_input['particles_poss'] = model_input['particles_poss'].squeeze(0).cuda()
+                # model_input['rays'] = model_input['rays'].cuda()
                 
                 self.optimizer.zero_grad()
                 
@@ -316,8 +321,8 @@ class MonoSDFTrainRunner():
             'rgb_eval': rgb_eval,
             'normal_map': normal_map,
             'depth_map': depth_map,
-            "pred_points": pred_points,
-            "gt_points": gt_points,
+            # "pred_points": pred_points,
+            # "gt_points": gt_points,
         }
 
         return plot_data
@@ -327,5 +332,15 @@ class MonoSDFTrainRunner():
         
         K_inv = torch.inverse(model_input["intrinsics"][0])[None]
         points = self.backproject(depth, K_inv)[0, :3, :].permute(1, 0)
+        # points_cpu = points.cpu().numpy()
+        # import matplotlib
+        # matplotlib.use('Agg')
+        # from matplotlib import pyplot as plt
+        # from mpl_toolkits.mplot3d import Axes3D
+        # fig = plt.figure()
+        # ax = Axes3D(fig)
+        # ax.scatter(points_cpu[:,0], points_cpu[:,1], points_cpu[:,2], s=1, c='r', marker='.', alpha=0.1)
+        # # plt.show()
+        # plt.savefig('samples.png')
         points = torch.cat([points, color], dim=-1)
         return points.detach().cpu().numpy()

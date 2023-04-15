@@ -9,9 +9,11 @@ import cv2
 
 from utils import rend_util
 from utils.general import trans_topil
+import plotly.graph_objs as go
+import plotly.offline as offline
 
 
-def plot(implicit_network, indices, plot_data, path, epoch, img_res, plot_nimgs, resolution, grid_boundary,  level=0):
+def plot(implicit_network, indices, plot_data, physical_particles, path, epoch, img_res, plot_nimgs, resolution, grid_boundary,  level=0):
 
     if plot_data is not None:
         cam_loc, cam_dir = rend_util.get_camera_for_plot(plot_data['pose'])
@@ -33,22 +35,52 @@ def plot(implicit_network, indices, plot_data, path, epoch, img_res, plot_nimgs,
         images = np.concatenate(images, axis=1)
         cv2.imwrite('{0}/merge_{1}_{2}.png'.format(path, epoch, indices[0]), images)
 
-    surface_traces = get_surface_sliding(path=path,
-                                         epoch=epoch,
-                                         sdf=lambda x: implicit_network(x)[:, 0],
-                                         resolution=resolution,
-                                         grid_boundary=grid_boundary,
-                                         level=level
-                                         )
+    # surface_traces = get_surface_sliding(path=path,
+    #                                      epoch=epoch,
+    #                                      sdf=lambda x,y: implicit_network(x,y)[:, 0],
+    #                                      physical_particles = physical_particles,
+    #                                      resolution=resolution,
+    #                                      grid_boundary=grid_boundary,
+    #                                      level=level
+    #                                      )
+
+    data = []
+
+    # plot surface
+    surface_traces = get_surface_trace(path=path,
+                                       epoch=epoch,
+                                       sdf=lambda x,y: implicit_network(x,y)[:, 0],
+                                       physical_particles = physical_particles,
+                                       resolution=resolution,
+                                       grid_boundary=grid_boundary,
+                                       level=level
+                                       )
+
+    if surface_traces is not None:
+        data.append(surface_traces[0])
+
+    # plot cameras locations
+    if plot_data is not None:
+        for i, loc, dir in zip(indices, cam_loc, cam_dir):
+            data.append(get_3D_quiver_trace(loc.unsqueeze(0), dir.unsqueeze(0), name='camera_{0}'.format(i)))
+
+    fig = go.Figure(data=data)
+    scene_dict = dict(xaxis=dict(range=[-6, 6], autorange=False),
+                      yaxis=dict(range=[-6, 6], autorange=False),
+                      zaxis=dict(range=[-6, 6], autorange=False),
+                      aspectratio=dict(x=1, y=1, z=1))
+    fig.update_layout(scene=scene_dict, width=1200, height=1200, showlegend=True)
+    filename = '{0}/surface_{1}.html'.format(path, epoch)
+    offline.plot(fig, filename=filename, auto_open=False)
 
 avg_pool_3d = torch.nn.AvgPool3d(2, stride=2)
 upsample = torch.nn.Upsample(scale_factor=2, mode='nearest')
 
 @torch.no_grad()
-def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0], return_mesh=False, level=0):
-    assert resolution % 512 == 0
+def get_surface_sliding(path, epoch, sdf, physical_particles, resolution=100, grid_boundary=[-2.0, 2.0], return_mesh=False, level=0):
+    assert resolution % 128 == 0
     resN = resolution
-    cropN = 512
+    cropN = 128
     level = 0
     N = resN // cropN
 
@@ -77,15 +109,18 @@ def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2
                 xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
                 points = torch.tensor(np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T, dtype=torch.float).cuda()
                 
-                def evaluate(points):
+                def evaluate(points, physical_particles):
                     z = []
+                    # points
                     for _, pnts in enumerate(torch.split(points, 100000, dim=0)):
-                        z.append(sdf(pnts))
+                        print('index: ', _)
+                        pnts = pnts.unsqueeze(1)
+                        z.append(sdf(pnts, physical_particles))
                     z = torch.cat(z, axis=0)
                     return z
             
                 # construct point pyramids
-                points = points.reshape(cropN, cropN, cropN, 3).permute(3, 0, 1, 2)
+                points = points.reshape(cropN, cropN, cropN, 3).permute(3, 0, 1, 2) # 3,512,512,512
                 points_pyramid = [points]
                 for _ in range(3):            
                     points = avg_pool_3d(points[None])[0]
@@ -100,13 +135,14 @@ def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2
                     pts = pts.reshape(3, -1).permute(1, 0).contiguous()
                     
                     if mask is None:    
-                        pts_sdf = evaluate(pts)
+                        pts_sdf = evaluate(pts, physical_particles)
                     else:                    
                         mask = mask.reshape(-1)
                         pts_to_eval = pts[mask]
                         #import pdb; pdb.set_trace()
                         if pts_to_eval.shape[0] > 0:
-                            pts_sdf_eval = evaluate(pts_to_eval.contiguous())
+                            print("pts_to_eval", pts_to_eval.shape[0])
+                            pts_sdf_eval = evaluate(pts_to_eval.contiguous(), physical_particles)
                             pts_sdf[mask] = pts_sdf_eval
                         print("ratio", pts_to_eval.shape[0] / pts.shape[0])
 
@@ -124,6 +160,8 @@ def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2
 
                 z = pts_sdf.detach().cpu().numpy()
 
+                # 如果最小值大于0或最大值小于0，说明没有交点，不需要继续计算
+                a, b = np.min(z), np.max(z)
                 if (not (np.min(z) > level or np.max(z) < level)):
                     z = z.astype(np.float32)
                     verts, faces, normals, values = measure.marching_cubes(
@@ -147,7 +185,10 @@ def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2
     if return_mesh:
         return combined
     else:
-        combined.export('{0}/surface_{1}.ply'.format(path, epoch), 'ply')    
+        try:
+            combined.export('{0}/surface_{1}.ply'.format(path, epoch), 'ply')   
+        except:
+            pass
         
 def get_3D_scatter_trace(points, name='', size=3, caption=None):
     assert points.shape[1] == 3, "3d scatter plot input points are not correctely shaped "
@@ -194,13 +235,14 @@ def get_3D_quiver_trace(points, directions, color='#bd1540', name=''):
     return trace
 
 
-def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0], return_mesh=False, level=0):
+def get_surface_trace(path, epoch, sdf, physical_particles, resolution=100, grid_boundary=[-2.0, 2.0], return_mesh=False, level=0):
     grid = get_grid_uniform(resolution, grid_boundary)
     points = grid['grid_points']
 
     z = []
     for i, pnts in enumerate(torch.split(points, 100000, dim=0)):
-        z.append(sdf(pnts.cuda()).detach().cpu().numpy())
+        pnts = pnts.unsqueeze(1)
+        z.append(sdf(pnts.cuda(), physical_particles).detach().cpu().numpy())
     z = np.concatenate(z, axis=0)
 
     if (not (np.min(z) > level or np.max(z) < level)):
@@ -216,7 +258,7 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
                      grid['xyz'][0][2] - grid['xyz'][0][1]))
 
         verts = verts + np.array([grid['xyz'][0][0], grid['xyz'][1][0], grid['xyz'][2][0]])
-        '''
+
         I, J, K = faces.transpose()
 
         traces = [go.Mesh3d(x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
@@ -224,13 +266,13 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
                             color='#ffffff', opacity=1.0, flatshading=False,
                             lighting=dict(diffuse=1, ambient=0, specular=0),
                             lightposition=dict(x=0, y=0, z=-1), showlegend=True)]
-        '''
+
         meshexport = trimesh.Trimesh(verts, faces, normals)
         meshexport.export('{0}/surface_{1}.ply'.format(path, epoch), 'ply')
 
         if return_mesh:
             return meshexport
-        #return traces
+        return traces
     return None
 
 def get_surface_high_res_mesh(sdf, resolution=100, grid_boundary=[-2.0, 2.0], level=0, take_components=True):

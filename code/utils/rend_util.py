@@ -46,8 +46,9 @@ def load_K_Rt_from_P(filename, P=None):
     intrinsics[:3, :3] = K
 
     pose = np.eye(4, dtype=np.float32)
-    pose[:3, :3] = R.transpose()
-    pose[:3,3] = (t[:3] / t[3])[:,0]
+    # pose[:3, :3] = R.transpose()
+    pose[:3, :3] = R
+    pose[:3,3] = (t[:3] / -t[3])[:,0]
 
     return intrinsics, pose
 
@@ -79,6 +80,19 @@ def get_camera_params(uv, pose, intrinsics):
     ray_dirs = world_coords - cam_loc[:, None, :]
     ray_dirs = F.normalize(ray_dirs, dim=2)
 
+    from kornia import create_meshgrid
+    H = batch_size*400
+    W = batch_size*400
+    focal_cpu = intrinsics[:, 0, 0].detach().cpu().numpy()
+    pose_cpu = pose[0][:3, :3].detach().cpu().numpy()
+    grid = create_meshgrid(H, W, normalized_coordinates=False)[0]
+    i, j = grid.unbind(-1)
+    uv = uv[0].long()
+    directions = torch.stack([(i-W/2)/focal_cpu, -(j-H/2)/focal_cpu, -torch.ones_like(i)], -1) # (400, 400, 3)
+    
+    rays_d = directions @ pose_cpu.T # (H, W, 3)
+    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    ray_dirs = rays_d[uv[:, 1], uv[:, 0]].unsqueeze(0).cuda()
     return ray_dirs, cam_loc
 
 

@@ -12,9 +12,9 @@ import torch.nn.functional as F
 scans = [24, 37, 40, 55, 63, 65, 69, 83, 97, 105, 106, 110, 114, 118, 122]
 
 for scan in scans:
-    fullres_image_dir = f"../data/DTU/scan{scan}/image"
-    instance_dir = f"../data/DTU/scan{scan}/"
-    out_dir = f"../data/DTU_padded_highres/scan{scan}"
+    fullres_image_dir = f"/home/rayne/datasets/monosdf/DTU/scan{scan}/image"
+    instance_dir = f"/home/rayne/datasets/monosdf/DTU/scan{scan}/"
+    out_dir = f"/home/rayne/datasets/monosdf/DTU_padded_highres/scan{scan}"
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 

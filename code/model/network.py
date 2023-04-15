@@ -8,6 +8,8 @@ from model.density import LaplaceDensity
 from model.ray_sampler import ErrorBoundSampler
 import matplotlib.pyplot as plt
 import numpy as np
+from pytorch3d.ops import ball_query
+from model.nerf import Embedding
 
 class ImplicitNetwork(nn.Module):
     def __init__(
@@ -143,6 +145,7 @@ class ImplicitNetworkGrid(nn.Module):
             self,
             feature_vector_size,
             sdf_bounding_sphere,
+            position_encoding_size,
             d_in,
             d_out,
             dims,
@@ -159,18 +162,29 @@ class ImplicitNetworkGrid(nn.Module):
             num_levels=16,
             level_dim=2,
             divide_factor = 1.5, # used to normalize the points range for multi-res grid
+            NN_search = {},
+            encoding = {},
             use_grid_feature = True
     ):
         super().__init__()
 
         self.sdf_bounding_sphere = sdf_bounding_sphere
         self.sphere_scale = sphere_scale
-        dims = [d_in] + dims + [d_out + feature_vector_size]
+        dims = [d_in + position_encoding_size] + dims + [d_out + feature_vector_size]
         self.embed_fn = None
         self.divide_factor = divide_factor
         self.grid_feature_dim = num_levels * level_dim
         self.use_grid_feature = use_grid_feature
         dims[0] += self.grid_feature_dim
+        # dims [230, 256, 256, 257]
+        self.radius = NN_search['search_radius_scale'] * NN_search['particle_radius']
+        self.fix_radius = NN_search['fix_radius']
+        self.num_neighbor = NN_search['N_neighbor']
+        self.encoding_cfg = encoding
+        self.embedding_xyz = Embedding(3, 10)
+        self.embedding_dir = Embedding(3, 4)
+        if self.encoding_cfg['density']:
+            self.embedding_density = Embedding(1, 4)
         
         print(f"using hash encoder with {num_levels} levels, each level with feature dim {level_dim}")
         print(f"resolution:{base_size} -> {end_size} with hash map size {logmap}")
@@ -210,6 +224,7 @@ class ImplicitNetworkGrid(nn.Module):
             else:
                 out_dim = dims[l + 1]
 
+            # print('layer', l, 'in', dims[l], 'out', out_dim)
             lin = nn.Linear(dims[l], out_dim)
 
             if geometric_init:
@@ -221,17 +236,17 @@ class ImplicitNetworkGrid(nn.Module):
                         torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                         torch.nn.init.constant_(lin.bias, bias)
 
-                elif multires > 0 and l == 0:
+                elif l == 0:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
                     torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                elif multires > 0 and l in self.skip_in:
+                elif l in self.skip_in:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
                     torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
                 else:
                     torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(dims[l]))
 
             if weight_norm:
                 lin = nn.utils.weight_norm(lin)
@@ -241,37 +256,49 @@ class ImplicitNetworkGrid(nn.Module):
         self.softplus = nn.Softplus(beta=100)
         self.cache_sdf = None
 
-    def forward(self, input):
+    def forward(self, input, physical_particles):
         if self.use_grid_feature:
             # normalize point range as encoding assume points are in [-1, 1]
+            # print(input.min().item(),input.max().item())
             feature = self.encoding(input / self.divide_factor)
         else:
-            feature = torch.zeros_like(input[:, :1].repeat(1, self.grid_feature_dim))
+            feature = torch.zeros_like(input[:, :, :1].repeat(1, 1, 1, self.grid_feature_dim)).squeeze(0)
+        # add position embdding here
+        # search
+        dists_0, indices_0, neighbors_0, radius_0 = self.search(input, physical_particles, self.fix_radius)
+        # embedding attributes
+        pos_like_feats_0 = self.embedding_local_geometry(dists_0, indices_0, neighbors_0, radius_0, input)
+        pos_input_feats_0 = torch.cat(pos_like_feats_0, dim=1).reshape(feature.shape[0], feature.shape[1], -1)
                     
         if self.embed_fn is not None:
             embed = self.embed_fn(input)
             input = torch.cat((embed, feature), dim=-1)
         else:
-            input = torch.cat((input, feature), dim=-1)
+            input = torch.cat((pos_input_feats_0, feature), dim=-1)
 
+        input = input.reshape(-1, input.shape[-1]) # [131072, 230]
         x = input
+        # print('input', round(input.min().item(),2),round(input.max().item(),2))
 
         for l in range(0, self.num_layers - 1):
+            # print('layer', l)
             lin = getattr(self, "lin" + str(l))
 
             if l in self.skip_in:
                 x = torch.cat([x, input], 1) / np.sqrt(2)
 
             x = lin(x)
+            # print('x1', round(x.min().item(),2),round(x.max().item(),2))
 
             if l < self.num_layers - 2:
                 x = self.softplus(x)
+            # print('x2', round(x.min().item(),2),round(x.max().item(),2))
 
         return x
 
-    def gradient(self, x):
+    def gradient(self, x, physical_particles):
         x.requires_grad_(True)
-        y = self.forward(x)[:,:1]
+        y = self.forward(x, physical_particles)[:,:1]
         d_output = torch.ones_like(y, requires_grad=False, device=y.device)
         gradients = torch.autograd.grad(
             outputs=y,
@@ -282,10 +309,10 @@ class ImplicitNetworkGrid(nn.Module):
             only_inputs=True)[0]
         return gradients
 
-    def get_outputs(self, x):
-        x.requires_grad_(True)
-        output = self.forward(x)
-        sdf = output[:,:1]
+    def get_outputs(self, x, physical_particles):
+        x.requires_grad_(True) # (1024,98,3)
+        output = self.forward(x, physical_particles)
+        sdf = output[:,:1] # (100352, 1)
 
         feature_vectors = output[:, 1:]
         d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
@@ -299,8 +326,8 @@ class ImplicitNetworkGrid(nn.Module):
 
         return sdf, feature_vectors, gradients
 
-    def get_sdf_vals(self, x):
-        sdf = self.forward(x)[:,:1]
+    def get_sdf_vals(self, x, physical_particles):
+        sdf = self.forward(x, physical_particles)[:,:1]
         return sdf
 
     def mlp_parameters(self):
@@ -316,23 +343,109 @@ class ImplicitNetworkGrid(nn.Module):
             print(p.shape)
         return self.encoding.parameters()
 
+    def search(self, ray_particles, particles, fix_radius):
+        # particles (6320, 3) 不应该是(1, 6320, 3)
+        # ray_particles (1024, 128, 3)
+        raw_data = particles.unsqueeze(0).repeat(ray_particles.shape[0], 1, 1)
+        if fix_radius:
+            radius = self.radius
+            dists, indices, neighbors = ball_query(p1=ray_particles, 
+                                                   p2=raw_data, 
+                                                   radius=radius, K=self.num_neighbor)
+        # else:
+        #     radius = self.get_search_radius(self.radius, ray_particles[:,:,-1] - ro[-1], focal)
+        #     dists, indices, neighbors = self._ball_query(ray_particles, raw_data, radius, self.num_neighbor)
+        return dists, indices, neighbors, radius
+
+    def embedding_local_geometry(self, dists, indices, neighbors, radius, ray_particles):
+        """
+        pos like feats
+            1. smoothed positions
+            2. ref hit pos, i.e., ray position
+            3. density
+            3. variance
+        dir like feats
+            1. hit direction, i.e., ray direction
+            2. main direction after PCA
+        """
+        # calculate mask
+        nn_mask = dists.ne(0)
+        num_nn = nn_mask.sum(-1, keepdim=True)
+
+        # hit pos and hit direction (basic in NeRF formulation)
+        pos_like_feats = []
+        hit_pos = ray_particles.reshape(-1,3)
+        hit_pos_embedded = self.embedding_xyz(hit_pos)
+        pos_like_feats.append(hit_pos_embedded)
+        # smoothing 
+        smoothed_pos, density = self.smoothing_position(ray_particles, neighbors, radius, num_nn, exclude_ray=self.encoding_cfg['exclude_ray'])
+        # density
+        if self.encoding_cfg['density']:
+            density_embedded = self.embedding_density(density.reshape(-1, 1))
+            pos_like_feats.append(density_embedded)
+        # smoothed pos
+        if self.encoding_cfg['smoothed_pos']:
+            smoothed_pos_embedded = self.embedding_xyz(smoothed_pos.reshape(-1, 3))
+            pos_like_feats.append(smoothed_pos_embedded)
+        # variance
+        if self.encoding_cfg['var']:
+            vec_pp2rp = torch.zeros(ray_particles.shape[0], ray_particles.shape[1], self.num_neighbor, 3).to(neighbors.device)
+            vec_pp2rp[nn_mask] = (neighbors - ray_particles.unsqueeze(-2))[nn_mask]
+            vec_pp2rp_mean = vec_pp2rp.sum(-2) / (num_nn+1e-12)
+            variance = torch.zeros(ray_particles.shape[0], ray_particles.shape[1], self.num_neighbor, 3).to(neighbors.device)
+            variance[nn_mask] = ((vec_pp2rp - vec_pp2rp_mean.unsqueeze(-2))**2)[nn_mask]
+            variance = variance.sum(-2) / (num_nn+1e-12)
+            variance_embedded = self.embedding_xyz(variance.reshape(-1,3))
+            pos_like_feats.append(variance_embedded)
+        # smoothed dir
+        return pos_like_feats
+    
+    def smoothing_position(self, ray_pos, nn_poses, raduis, num_nn, exclude_ray=True, larger_alpha=0.9, smaller_alpha=0.1):
+        dists = torch.norm(nn_poses - ray_pos.unsqueeze(-2), dim=-1)
+        weights = torch.clamp(1 - (dists / raduis) ** 3, min=0)
+        weighted_nn = (weights.unsqueeze(-1) * nn_poses).sum(-2) / (weights.sum(-1, keepdim=True)+1e-12)
+        if exclude_ray:
+            pos = weighted_nn
+        else:
+            if self.encoding_cfg['same_smooth_factor']:
+                alpha = torch.ones(ray_pos.shape[0], ray_pos.shape[1], 1) * larger_alpha
+            else:
+                alpha = torch.ones(ray_pos.shape[0], ray_pos.shape[1], 1) * larger_alpha
+                alpha[num_nn.le(20)] = smaller_alpha
+            pos = ray_pos * (1-alpha) + weighted_nn * alpha
+        return pos, weights.sum(-1, keepdim=True)
+    
+    def get_particles_direction(self, particles, ro):
+        ros = ro.expand(particles.shape[0], -1)
+        dirs = particles - ros
+        dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
+        return dirs
 
 class RenderingNetwork(nn.Module):
     def __init__(
             self,
             feature_vector_size,
+            position_encoding_size,
+            dir_encoding_size,
+            normal_size,
             mode,
             d_in,
             d_out,
             dims,
             weight_norm=True,
             multires_view=0,
+            NN_search = {},
+            encoding = {},
+            bias=1.0,
+            geometric_init=True,
             per_image_code = False
     ):
         super().__init__()
 
         self.mode = mode
-        dims = [d_in + feature_vector_size] + dims + [d_out]
+        # dims = [d_in + feature_vector_size] + dims + [d_out]
+        dims = [d_in + feature_vector_size + position_encoding_size + dir_encoding_size + normal_size] + dims + [d_out]
+
 
         self.embedview_fn = None
         if multires_view > 0:
@@ -354,11 +467,32 @@ class RenderingNetwork(nn.Module):
         print(dims)
 
         self.num_layers = len(dims)
+        self.radius = NN_search['search_radius_scale'] * NN_search['particle_radius']
+        self.fix_radius = NN_search['fix_radius']
+        self.num_neighbor = NN_search['N_neighbor']
+        self.encoding_cfg = encoding
+        self.embedding_xyz = Embedding(3, 10)
+        self.embedding_dir = Embedding(3, 4)
+        if self.encoding_cfg['density']:
+            self.embedding_density = Embedding(1, 4)
 
         for l in range(0, self.num_layers - 1):
             out_dim = dims[l + 1]
             lin = nn.Linear(dims[l], out_dim)
 
+            if geometric_init:
+                if l == self.num_layers - 2:
+                    # torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                    torch.nn.init.normal_(lin.weight, mean=0.0, std=0.0001)
+                    torch.nn.init.constant_(lin.bias, -bias)
+                elif multires_view > 0 and l == 0:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
+                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                else:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+            
             if weight_norm:
                 lin = nn.utils.weight_norm(lin)
 
@@ -367,14 +501,24 @@ class RenderingNetwork(nn.Module):
         self.relu = nn.ReLU()
         self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, points, normals, view_dirs, feature_vectors, indices):
+    def forward(self, points, normals, view_dirs, feature_vectors, indices, physical_particles, rays = [], ro = []):
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
+        # add position embdding here
+        # search
+        dists_0, indices_0, neighbors_0, radius_0 = self.search(points, physical_particles, self.fix_radius)
+        # embedding attributes
+        pos_like_feats_0, dirs_like_feats_0, num_nn_0 = self.embedding_local_geometry(dists_0, indices_0, neighbors_0, radius_0, points, rays, ro)
+        pos_input_feats_0 = torch.cat(pos_like_feats_0, dim=1) # 100352, 198
+        dir_input_feats_0 = torch.cat(dirs_like_feats_0, dim=1) # 100352, 54
+        # pos_input_feats_0 = pos_input_feats_0.reshape(feature_vectors.shape[0], feature_vectors.shape[1], -1)
+        # feature_vectors [100352, 256]
+        # normals [1024, 98, 3] -> [100352, 3]
 
         if self.mode == 'idr':
-            rendering_input = torch.cat([points, view_dirs, normals, feature_vectors], dim=-1)
+            rendering_input = torch.cat([pos_input_feats_0, dir_input_feats_0, normals, feature_vectors], dim=-1)
         elif self.mode == 'nerf':
-            rendering_input = torch.cat([view_dirs, feature_vectors], dim=-1)
+            rendering_input = torch.cat([dir_input_feats_0, feature_vectors], dim=-1)
         else:
             raise NotImplementedError
 
@@ -387,13 +531,104 @@ class RenderingNetwork(nn.Module):
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
 
-            x = lin(x)
+            x = lin(x) # (100352, 543)
 
             if l < self.num_layers - 2:
                 x = self.relu(x)
         
         x = self.sigmoid(x)
         return x
+
+    def search(self, ray_particles, particles, fix_radius):
+        raw_data = particles.unsqueeze(0).repeat(ray_particles.shape[0], 1, 1)
+        if fix_radius:
+            radius = self.radius
+            dists, indices, neighbors = ball_query(p1=ray_particles, 
+                                                   p2=raw_data, 
+                                                   radius=radius, K=self.num_neighbor)
+        # else:
+        #     radius = self.get_search_radius(self.radius, ray_particles[:,:,-1] - ro[-1], focal)
+        #     dists, indices, neighbors = self._ball_query(ray_particles, raw_data, radius, self.num_neighbor)
+        return dists, indices, neighbors, radius
+    
+    def embedding_local_geometry(self, dists, indices, neighbors, radius, ray_particles, rays = [], ro = [], sigma_only=False):
+        """
+        pos like feats
+            1. smoothed positions
+            2. ref hit pos, i.e., ray position
+            3. density
+            3. variance
+        dir like feats
+            1. hit direction, i.e., ray direction
+            2. main direction after PCA
+        """
+        # calculate mask
+        nn_mask = dists.ne(0)
+        num_nn = nn_mask.sum(-1, keepdim=True)
+
+        # hit pos and hit direction (basic in NeRF formulation)
+        pos_like_feats = []
+        hit_pos = ray_particles.reshape(-1,3)
+        hit_pos_embedded = self.embedding_xyz(hit_pos)
+        pos_like_feats.append(hit_pos_embedded)
+        if not sigma_only:
+            hit_dir = rays[:,3:]
+            hit_dir_embedded = self.embedding_dir(hit_dir)
+            hit_dir_embedded = torch.repeat_interleave(hit_dir_embedded, repeats=ray_particles.shape[1], dim=0)
+            dir_like_feats = []
+            dir_like_feats.append(hit_dir_embedded)
+        # smoothing 
+        smoothed_pos, density = self.smoothing_position(ray_particles, neighbors, radius, num_nn, exclude_ray=self.encoding_cfg['exclude_ray'])
+        if not sigma_only:
+            smoothed_dir = self.get_particles_direction(smoothed_pos.reshape(-1, 3), ro)
+        # density
+        if self.encoding_cfg['density']:
+            density_embedded = self.embedding_density(density.reshape(-1, 1))
+            pos_like_feats.append(density_embedded)
+        # smoothed pos
+        if self.encoding_cfg['smoothed_pos']:
+            smoothed_pos_embedded = self.embedding_xyz(smoothed_pos.reshape(-1, 3))
+            pos_like_feats.append(smoothed_pos_embedded)
+        # variance
+        if self.encoding_cfg['var']:
+            vec_pp2rp = torch.zeros(ray_particles.shape[0], ray_particles.shape[1], self.num_neighbor, 3).to(neighbors.device)
+            vec_pp2rp[nn_mask] = (neighbors - ray_particles.unsqueeze(-2))[nn_mask]
+            vec_pp2rp_mean = vec_pp2rp.sum(-2) / (num_nn+1e-12)
+            variance = torch.zeros(ray_particles.shape[0], ray_particles.shape[1], self.num_neighbor, 3).to(neighbors.device)
+            variance[nn_mask] = ((vec_pp2rp - vec_pp2rp_mean.unsqueeze(-2))**2)[nn_mask]
+            variance = variance.sum(-2) / (num_nn+1e-12)
+            variance_embedded = self.embedding_xyz(variance.reshape(-1,3))
+            pos_like_feats.append(variance_embedded)
+        # smoothed dir
+        if not sigma_only:
+            if self.encoding_cfg['smoothed_dir']:
+                smoothed_dir_embedded = self.embedding_dir(smoothed_dir)
+                dir_like_feats.append(smoothed_dir_embedded)
+        if not sigma_only:
+            return pos_like_feats, dir_like_feats, num_nn
+        else:
+            return pos_like_feats
+    
+    def smoothing_position(self, ray_pos, nn_poses, raduis, num_nn, exclude_ray=True, larger_alpha=0.9, smaller_alpha=0.1):
+        dists = torch.norm(nn_poses - ray_pos.unsqueeze(-2), dim=-1)
+        weights = torch.clamp(1 - (dists / raduis) ** 3, min=0)
+        weighted_nn = (weights.unsqueeze(-1) * nn_poses).sum(-2) / (weights.sum(-1, keepdim=True)+1e-12)
+        if exclude_ray:
+            pos = weighted_nn
+        else:
+            if self.encoding_cfg['same_smooth_factor']:
+                alpha = torch.ones(ray_pos.shape[0], ray_pos.shape[1], 1) * larger_alpha
+            else:
+                alpha = torch.ones(ray_pos.shape[0], ray_pos.shape[1], 1) * larger_alpha
+                alpha[num_nn.le(20)] = smaller_alpha
+            pos = ray_pos * (1-alpha) + weighted_nn * alpha
+        return pos, weights.sum(-1, keepdim=True)
+    
+    def get_particles_direction(self, particles, ro):
+        ros = ro.expand(particles.shape[0], -1)
+        dirs = particles - ros
+        dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
+        return dirs
 
 
 class MonoSDFNetwork(nn.Module):
@@ -416,6 +651,13 @@ class MonoSDFNetwork(nn.Module):
         self.density = LaplaceDensity(**conf.get_config('density'))
         sampling_method = conf.get_string('sampling_method', default="errorbounded")
         self.ray_sampler = ErrorBoundSampler(self.scene_bounding_sphere, **conf.get_config('ray_sampler'))
+        # for name, parms in self.implicit_network.named_parameters():	
+        #     print('-->name:', name)
+        #     print('-->para:', parms)
+        #     print('-->grad_requirs:',parms.requires_grad)
+        #     print('-->grad_value:',parms.grad)
+        #     print('-->is_leaf:',parms.is_leaf)
+        #     print("===")
         
 
     def forward(self, input, indices):
@@ -423,8 +665,11 @@ class MonoSDFNetwork(nn.Module):
         intrinsics = input["intrinsics"]
         uv = input["uv"]
         pose = input["pose"]
+        physical_particles = input["particles_poss"]
+        # rays = input["rays"]
 
         ray_dirs, cam_loc = rend_util.get_camera_params(uv, pose, intrinsics)
+        ro = cam_loc[0] # [9.6846, 0.0000, 4.6888]
         
         # we should use unnormalized ray direction for depth
         ray_dirs_tmp, _ = rend_util.get_camera_params(uv, torch.eye(4).to(pose.device)[None], intrinsics)
@@ -434,11 +679,22 @@ class MonoSDFNetwork(nn.Module):
 
         cam_loc = cam_loc.unsqueeze(1).repeat(1, num_pixels, 1).reshape(-1, 3)
         ray_dirs = ray_dirs.reshape(-1, 3)
+        rays = torch.cat([cam_loc, ray_dirs], dim=-1)
 
         
-        z_vals, z_samples_eik = self.ray_sampler.get_z_vals(ray_dirs, cam_loc, self)
+        z_vals, z_samples_eik = self.ray_sampler.get_z_vals(ray_dirs, cam_loc, self, physical_particles)
         N_samples = z_vals.shape[1]
 
+        # ray_dirs_1 = torch.tensor([ [0, 0, 1] for _ in range (ray_dirs.shape[0]) ]).cuda()
+        # ray_dirs_2 = torch.tensor([ [0, 1, 0] for _ in range (ray_dirs.shape[0]) ]).cuda()
+        # ray_dirs_3 = torch.tensor([ [1, 0, 0] for _ in range (ray_dirs.shape[0]) ]).cuda()
+        # points_1 = cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs_1.unsqueeze(1)
+        # points_2 = cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs_2.unsqueeze(1)
+        # points_3 = cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs_3.unsqueeze(1)
+        # print('points_1', round(points_1.min().item(),2),round(points_1.max().item(),2))
+        # print('points_2', round(points_2.min().item(),2),round(points_2.max().item(),2))
+        # print('points_3', round(points_3.min().item(),2),round(points_3.max().item(),2))
+        # points.min(), points.max() = -13.0, 22.69
         points = cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs.unsqueeze(1)
         points_flat = points.reshape(-1, 3)
 
@@ -446,9 +702,12 @@ class MonoSDFNetwork(nn.Module):
         dirs = ray_dirs.unsqueeze(1).repeat(1,N_samples,1)
         dirs_flat = dirs.reshape(-1, 3)
 
-        sdf, feature_vectors, gradients = self.implicit_network.get_outputs(points_flat)
+        sdf, feature_vectors, gradients = self.implicit_network.get_outputs(points, physical_particles)
+        print('sdf', round(sdf.min().item(),2),round(sdf.max().item(),2))
+        gradients_flat = gradients.reshape(-1, 3)
         
-        rgb_flat = self.rendering_network(points_flat, gradients, dirs_flat, feature_vectors, indices)
+        rgb_flat = self.rendering_network(points, gradients_flat, dirs, feature_vectors, indices, physical_particles, rays, ro)
+        # rgb_flat = self.rendering_network(pos_input_feats_0, gradients, dir_input_feats_0, feature_vectors, indices)
         rgb = rgb_flat.reshape(-1, N_samples, 3)
 
         weights = self.volume_rendering(z_vals, sdf)
@@ -486,8 +745,15 @@ class MonoSDFNetwork(nn.Module):
             # add some neighbour points as unisurf
             neighbour_points = eikonal_points + (torch.rand_like(eikonal_points) - 0.5) * 0.01   
             eikonal_points = torch.cat([eikonal_points, neighbour_points], 0)
+            # eikonal_points = eikonal_points.reshape(eik_near_points.shape[0], eikonal_points.shape[0]//eik_near_points.shape[0], eikonal_points.shape[1])
+            # dists, indices, neighbors, radius = self.search(eikonal_points, physical_particles, self.fix_radius)
+            # eikonal_pos_like_feats, _, _ = self.embedding_local_geometry(dists, indices, neighbors, radius, eikonal_points, rays, ro)
+            # eikonal_pos_like_feats = torch.cat(eikonal_pos_like_feats, dim=1)
+            # grad_theta = self.implicit_network.gradient(eikonal_pos_like_feats)
                    
-            grad_theta = self.implicit_network.gradient(eikonal_points)
+            # eikonal_points [4096, 3]
+            eikonal_points = eikonal_points.unsqueeze(1)
+            grad_theta = self.implicit_network.gradient(eikonal_points, physical_particles)
             
             # split gradient to eikonal points and heighbour ponits
             output['grad_theta'] = grad_theta[:grad_theta.shape[0]//2]

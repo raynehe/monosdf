@@ -20,7 +20,7 @@ from utils import rend_util
 def cull_scan(scan, mesh_path, result_mesh_file):
     
     # load poses
-    instance_dir = os.path.join('../data/DTU', 'scan{0}'.format(scan))
+    instance_dir = os.path.join('/home/rayne/datasets/monosdf/DTU', 'scan{0}'.format(scan))
     image_dir = '{0}/image'.format(instance_dir)
     image_paths = sorted(glob.glob(os.path.join(image_dir, "*.png")))
     n_images = len(image_paths)

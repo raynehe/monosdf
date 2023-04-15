@@ -28,10 +28,10 @@ depth_trans_totensor = transforms.Compose([
 ])
 
 
-out_path_prefix = '../data/Apartment/'
-data_root = '../nice-slam/'
-scenes = ['Apartment']
-out_names = ['scan1']
+out_path_prefix = '../data/fluiddata/'
+data_root = '/home/rayne/datasets/monosdf/fluiddata/scan0/abandon/'
+scenes = ['scan0']
+out_names = ['scan0']
 
 for scene, out_name in zip(scenes, out_names):
     out_path = os.path.join(out_path_prefix, out_name)
@@ -45,42 +45,42 @@ for scene, out_name in zip(scenes, out_names):
 
     # load color 
     color_path = os.path.join(data_root, scene, 'color')
-    color_paths = sorted(glob.glob(os.path.join(color_path, '*.jpg')), 
+    color_paths = sorted(glob.glob(os.path.join(color_path, '*.png')), 
         key=lambda x: int(os.path.basename(x)[:-4]))
     print(color_paths)
     
     # load depth
-    depth_path = os.path.join(data_root, scene, 'depth')
+    depth_path = os.path.join(data_root, scene, 'depth_rgb')
     depth_paths = sorted(glob.glob(os.path.join(depth_path, '*.png')), 
         key=lambda x: int(os.path.basename(x)[:-4]))
     print(depth_paths)
 
     # load intrinsic
     intrinsic_path = os.path.join(data_root, scene, 'intrinsic.json')
-    camera_intrinsic = np.array(json.load(open(intrinsic_path))["intrinsic_matrix"]).reshape(3, 3).T
+    # camera_intrinsic = np.array(json.load(open(intrinsic_path))["intrinsic_matrix"]).reshape(3, 3).T
+    camera_intrinsic = np.array(json.load(open(intrinsic_path))["intrinsic_matrix"])
     print(camera_intrinsic)
     
     # load pose
     poses = []
-    pose_path = os.path.join(data_root, scene, 'scene', 'trajectory.log')
+    # pose_path = os.path.join(data_root, scene, 'scene', 'trajectory.log')
+    pose_path = os.path.join(data_root, scene, 'scene', 'trajectory.npy')
+    poses = np.load(pose_path)
     
-    with open(pose_path) as f:
-        content = f.readlines()
-
-        # Load .log file.
-        for i in range(0, len(content), 5):
-            # format %d (src) %d (tgt) %f (fitness)
-            data = list(map(float, content[i].strip().split(' ')))
-            ids = (int(data[0]), int(data[1]))
-            fitness = data[2]
-
-            # format %f x 16
-            c2w = np.array(
-                list(map(float, (''.join(
-                    content[i + 1:i + 5])).strip().split()))).reshape((4, 4))
-
-            poses.append(c2w)
-    poses = np.stack(poses)
+    # with open(pose_path) as f:
+    #     content = f.readlines()
+    #     # Load .log file.
+    #     for i in range(0, len(content), 5):
+    #         # format %d (src) %d (tgt) %f (fitness)
+    #         data = list(map(float, content[i].strip().split(' ')))
+    #         ids = (int(data[0]), int(data[1]))
+    #         fitness = data[2]
+    #         # format %f x 16
+    #         c2w = np.array(
+    #             list(map(float, (''.join(
+    #                 content[i + 1:i + 5])).strip().split()))).reshape((4, 4))
+    #         poses.append(c2w)
+    # poses = np.stack(poses)
     print(poses.shape, len(depth_paths), len(color_paths))
 
     # deal with invalid poses
@@ -92,7 +92,7 @@ for scene, out_name in zip(scenes, out_names):
     scale = 2. / (np.max(max_vertices - min_vertices) + 3.)
     print(center, scale)
 
-    # we should normalized to unit cube
+    # we should normalized to unit cube - 不需要,nf的相机本来就是在球面上
     scale_mat = np.eye(4).astype(np.float32)
     scale_mat[:3, 3] = -center
     scale_mat[:3 ] *= scale 
@@ -102,22 +102,22 @@ for scene, out_name in zip(scenes, out_names):
     out_index = 0
     cameras = {}
     pcds = []
-    H, W = 720, 1280
+    H, W = 400, 400
     print(camera_intrinsic)
-    # center crop by 720
-    offset_x = (W - 720) * 0.5
-    offset_y = (H - 720) * 0.5
-    camera_intrinsic[0, 2] -= offset_x
-    camera_intrinsic[1, 2] -= offset_y
+    # # center crop by 720
+    # offset_x = (W - 720) * 0.5
+    # offset_y = (H - 720) * 0.5
+    # camera_intrinsic[0, 2] -= offset_x
+    # camera_intrinsic[1, 2] -= offset_y
     # resize
-    resize_factor = 384 / 720.
-    camera_intrinsic[:2, :] *= resize_factor
+    resize_factor = 384 / 400.
+    camera_intrinsic[:2, :] *= resize_factor # 这一步在scene_dataset.py中已经包含了
     
     K = np.eye(4)
     K[:3, :3] = camera_intrinsic
     print(K)
     
-    for idx, (valid, pose, depth_path, image_path) in enumerate(zip(valid_poses, poses, depth_paths, color_paths)):
+    for idx, (valid, pose, image_path) in enumerate(zip(valid_poses, poses, color_paths)):
         print(idx, valid)
         if idx % 20 != 0: continue
         if not valid : continue
@@ -133,15 +133,15 @@ for scene, out_name in zip(scenes, out_names):
         target_image = os.path.join(out_path, "mask/%03d.png"%(out_index))
         cv2.imwrite(target_image, mask)
 
-        # load depth
-        target_image = os.path.join(out_path, "depth/%06d.png"%(out_index))
-        depth = cv2.imread(depth_path, -1).astype(np.float32) / 1000.
-        #import pdb; pdb.set_trace()
-        depth_PIL = Image.fromarray(depth)
-        new_depth = depth_trans_totensor(depth_PIL)
-        new_depth = np.asarray(new_depth)
-        plt.imsave(target_image, new_depth, cmap='viridis')
-        np.save(target_image.replace(".png", ".npy"), new_depth)
+        # # load depth
+        # target_image = os.path.join(out_path, "depth/%06d.png"%(out_index))
+        # depth = cv2.imread(depth_path, -1).astype(np.float32) / 1000.
+        # #import pdb; pdb.set_trace()
+        # depth_PIL = Image.fromarray(np.uint8(depth))
+        # new_depth = depth_trans_totensor(depth_PIL)
+        # new_depth = np.asarray(new_depth)
+        # plt.imsave(target_image, new_depth, cmap='viridis')
+        # np.save(target_image.replace(".png", ".npy"), new_depth)
         
         # save pose
         pcds.append(pose[:3, 3])

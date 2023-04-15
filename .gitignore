@@ -1,3 +1,5 @@
+*.run
+
 code/run_logs
 
 # Byte-compiled / optimized / DLL files
@@ -138,6 +140,7 @@ data/BlendedMVS
 data/Replica
 data/tnt_advanced
 data/
+fluiddata/
 
 code/tmp_build
 
